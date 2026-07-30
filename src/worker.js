@@ -45,28 +45,36 @@ async function signature(secret, value) {
   ).join("");
 }
 
-function constantTimeEqual(left, right) {
-  if (left.length !== right.length) return false;
+async function constantTimeEqual(left, right) {
+  const encoder = new TextEncoder();
+  const [leftHash, rightHash] = await Promise.all([
+    crypto.subtle.digest("SHA-256", encoder.encode(left)),
+    crypto.subtle.digest("SHA-256", encoder.encode(right))
+  ]);
+  const leftBytes = new Uint8Array(leftHash);
+  const rightBytes = new Uint8Array(rightHash);
   let different = 0;
-  for (let index = 0; index < left.length; index += 1) {
-    different |= left.charCodeAt(index) ^ right.charCodeAt(index);
+  for (let index = 0; index < leftBytes.length; index += 1) {
+    different |= leftBytes[index] ^ rightBytes[index];
   }
   return different === 0;
 }
 
 async function authenticated(request, env) {
-  if (!env.ADMIN_PASSWORD) return true;
+  if (!env.ADMIN_PASSWORD) return false;
   const token = parseCookies(request)[SESSION_COOKIE] || "";
   const [expires, suppliedSignature] = token.split(".");
   if (!expires || !suppliedSignature || Number(expires) < Date.now()) return false;
   const expected = await signature(env.ADMIN_PASSWORD, expires);
-  return constantTimeEqual(expected, suppliedSignature);
+  return await constantTimeEqual(expected, suppliedSignature);
 }
 
 async function login(request, env) {
-  if (!env.ADMIN_PASSWORD) return json({ ok: true, protected: false });
+  if (!env.ADMIN_PASSWORD) {
+    return json({ error: "管理密碼尚未設定" }, 503);
+  }
   const payload = await request.json().catch(() => ({}));
-  if (!constantTimeEqual(clean(payload.password), clean(env.ADMIN_PASSWORD))) {
+  if (!(await constantTimeEqual(clean(payload.password), clean(env.ADMIN_PASSWORD)))) {
     return json({ error: "管理密碼不正確" }, 401);
   }
   const expires = String(Date.now() + SESSION_SECONDS * 1000);
@@ -277,7 +285,7 @@ async function api(request, env) {
   if (url.pathname === "/api/auth/status") {
     return json({
       authenticated: await authenticated(request, env),
-      protected: Boolean(env.ADMIN_PASSWORD)
+      protected: true
     });
   }
   if (url.pathname === "/api/auth/login" && request.method === "POST") {
@@ -309,7 +317,7 @@ export default {
       if (url.pathname.startsWith("/api/")) return await api(request, env);
       return env.ASSETS.fetch(request);
     } catch (error) {
-      return json({ error: error instanceof Error ? error.message : "系統錯誤" }, 500);
+      return json({ error: "系統暫時無法處理請求" }, 500);
     }
   }
 };

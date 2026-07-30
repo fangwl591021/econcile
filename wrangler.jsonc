@@ -3,6 +3,7 @@
   "name": "reconcile",
   "main": "src/worker.js",
   "compatibility_date": "2026-07-30",
+  "secrets": { "required": ["ADMIN_PASSWORD"] },
   "assets": {
     "directory": "./dist",
     "binding": "ASSETS",
@@ -12,7 +13,7 @@
     {
       "binding": "DB",
       "database_name": "reconcile-db",
-      "database_id": "REPLACE_WITH_D1_DATABASE_ID",
+      "database_id": "c9f862c9-aa0d-4bd5-bb33-d0fc807fc980",
       "migrations_dir": "migrations"
     }
   ]
