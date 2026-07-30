@@ -1,19 +1,25 @@
-const SESSION_COOKIE = "reconcile_admin";
-const SESSION_SECONDS = 12 * 60 * 60;
+import adminWorker from "./admin-worker.js";
+import {
+  CUSTOMER_SESSION_COOKIE,
+  CUSTOMER_SESSION_SECONDS,
+  decodeCustomerId,
+  encodeCustomerId,
+  maskPhone,
+  normalizeName,
+  normalizePhone,
+  validPhone
+} from "./customer-portal.js";
 
 const clean = (value) => String(value ?? "").trim();
-const numeric = (value) => {
-  const source = clean(value);
-  const negative = /^\(.*\)$/.test(source);
-  const parsed = Number(source.replace(/[^\d.-]/g, ""));
-  if (!Number.isFinite(parsed)) return 0;
-  return negative ? -Math.abs(parsed) : parsed;
-};
 
 function json(data, status = 200, headers = {}) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { "content-type": "application/json; charset=utf-8", ...headers }
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
+      ...headers
+    }
   });
 }
 
@@ -40,8 +46,9 @@ async function signature(secret, value) {
     key,
     new TextEncoder().encode(value)
   );
-  return Array.from(new Uint8Array(bytes), (byte) =>
-    byte.toString(16).padStart(2, "0")
+  return Array.from(
+    new Uint8Array(bytes),
+    (byte) => byte.toString(16).padStart(2, "0")
   ).join("");
 }
 
@@ -60,264 +67,283 @@ async function constantTimeEqual(left, right) {
   return different === 0;
 }
 
-async function authenticated(request, env) {
-  if (!env.ADMIN_PASSWORD) return false;
-  const token = parseCookies(request)[SESSION_COOKIE] || "";
-  const [expires, suppliedSignature] = token.split(".");
-  if (!expires || !suppliedSignature || Number(expires) < Date.now()) return false;
-  const expected = await signature(env.ADMIN_PASSWORD, expires);
-  return await constantTimeEqual(expected, suppliedSignature);
+function cookie(token, maxAge = CUSTOMER_SESSION_SECONDS) {
+  return `${CUSTOMER_SESSION_COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${maxAge}`;
 }
 
-async function login(request, env) {
-  if (!env.ADMIN_PASSWORD) {
-    return json({ error: "管理密碼尚未設定" }, 503);
-  }
-  const payload = await request.json().catch(() => ({}));
-  if (!(await constantTimeEqual(clean(payload.password), clean(env.ADMIN_PASSWORD)))) {
-    return json({ error: "管理密碼不正確" }, 401);
-  }
-  const expires = String(Date.now() + SESSION_SECONDS * 1000);
-  const token = `${expires}.${await signature(env.ADMIN_PASSWORD, expires)}`;
-  return json(
-    { ok: true, protected: true },
-    200,
-    {
-      "set-cookie": `${SESSION_COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${SESSION_SECONDS}`
-    }
-  );
+export async function createSession(env, customerId) {
+  const encodedId = encodeCustomerId(customerId);
+  const expires = String(Date.now() + CUSTOMER_SESSION_SECONDS * 1000);
+  const unsigned = `${encodedId}.${expires}`;
+  return `${unsigned}.${await signature(env.ADMIN_PASSWORD, unsigned)}`;
 }
 
-async function initializeDatabase(db) {
+export async function sessionCustomerId(request, env) {
+  if (!env.ADMIN_PASSWORD) return null;
+  const token = parseCookies(request)[CUSTOMER_SESSION_COOKIE] || "";
+  const [encodedId, expires, suppliedSignature] = token.split(".");
+  if (!encodedId || !expires || !suppliedSignature || Number(expires) < Date.now()) return null;
+  const expected = await signature(env.ADMIN_PASSWORD, `${encodedId}.${expires}`);
+  if (!(await constantTimeEqual(expected, suppliedSignature))) return null;
+  return decodeCustomerId(encodedId) || null;
+}
+
+function sameOrigin(request) {
+  const origin = request.headers.get("origin");
+  return !origin || origin === new URL(request.url).origin;
+}
+
+async function initializePortal(db) {
   await db.batch([
-    db.prepare(`CREATE TABLE IF NOT EXISTS customers (
-      id TEXT PRIMARY KEY, customer_code TEXT, payer_code TEXT NOT NULL UNIQUE,
-      name TEXT NOT NULL, phone TEXT, line_uid TEXT, virtual_account TEXT,
-      group_name TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+    db.prepare(`CREATE TABLE IF NOT EXISTS customer_lookup (
+      customer_id TEXT PRIMARY KEY,
+      name_normalized TEXT NOT NULL,
+      phone_normalized TEXT NOT NULL,
+      updated_at INTEGER NOT NULL,
+      FOREIGN KEY (customer_id) REFERENCES customers(id)
     )`),
-    db.prepare(`CREATE TABLE IF NOT EXISTS billing_records (
-      id TEXT PRIMARY KEY, customer_id TEXT, payer_code TEXT NOT NULL,
-      payer_name TEXT, group_name TEXT, billing_period TEXT NOT NULL,
-      due_date TEXT, channel TEXT, amount_due REAL NOT NULL DEFAULT 0,
-      amount_paid REAL NOT NULL DEFAULT 0, amount_outstanding REAL NOT NULL DEFAULT 0,
-      fee REAL NOT NULL DEFAULT 0, credited_amount REAL NOT NULL DEFAULT 0,
-      payment_date TEXT, credited_date TEXT, virtual_account TEXT, note TEXT,
-      status TEXT NOT NULL DEFAULT 'unpaid', source_import_id TEXT,
-      imported_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
-      UNIQUE(payer_code, billing_period)
+    db.prepare(`CREATE INDEX IF NOT EXISTS customer_lookup_identity_idx
+      ON customer_lookup(name_normalized, phone_normalized)`),
+    db.prepare(`CREATE INDEX IF NOT EXISTS customer_lookup_phone_idx
+      ON customer_lookup(phone_normalized)`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS customer_portal_bindings (
+      customer_id TEXT PRIMARY KEY,
+      phone_normalized TEXT NOT NULL UNIQUE,
+      bound_at INTEGER NOT NULL,
+      last_login_at INTEGER,
+      FOREIGN KEY (customer_id) REFERENCES customers(id)
     )`),
-    db.prepare(`CREATE TABLE IF NOT EXISTS import_batches (
-      id TEXT PRIMARY KEY, type TEXT NOT NULL, filename TEXT NOT NULL,
-      row_count INTEGER NOT NULL DEFAULT 0, matched_count INTEGER NOT NULL DEFAULT 0,
-      unmatched_count INTEGER NOT NULL DEFAULT 0, error_count INTEGER NOT NULL DEFAULT 0,
-      created_at INTEGER NOT NULL
-    )`)
+    db.prepare(`CREATE INDEX IF NOT EXISTS customer_portal_bindings_phone_idx
+      ON customer_portal_bindings(phone_normalized)`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS payment_reports (
+      id TEXT PRIMARY KEY,
+      customer_id TEXT NOT NULL,
+      billing_record_id TEXT,
+      phone_normalized TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      note TEXT,
+      created_at INTEGER NOT NULL,
+      resolved_at INTEGER,
+      FOREIGN KEY (customer_id) REFERENCES customers(id),
+      FOREIGN KEY (billing_record_id) REFERENCES billing_records(id)
+    )`),
+    db.prepare(`CREATE INDEX IF NOT EXISTS payment_reports_customer_idx
+      ON payment_reports(customer_id, created_at)`),
+    db.prepare(`CREATE INDEX IF NOT EXISTS payment_reports_status_idx
+      ON payment_reports(status)`)
   ]);
 }
 
-function statusOf(row, matched) {
-  if (!matched) return "unmatched";
-  const due = numeric(row.amountDue);
-  const paid = numeric(row.amountPaid);
-  const outstanding = numeric(row.amountOutstanding);
-  const credited = numeric(row.creditedAmount);
-  const note = clean(row.note);
-  if (paid > due || note.includes("溢繳")) return "overpaid";
-  if (paid > 0 && outstanding > 0) return "partial";
-  if (paid > 0 && (credited <= 0 || note.includes("未入帳") || !clean(row.creditedDate))) {
-    return "pending_credit";
-  }
-  if (paid > 0 && outstanding <= 0) return "paid";
-  return "unpaid";
-}
+async function matchingCustomer(db, nameNormalized, phoneNormalized) {
+  const cached = await db.prepare(`SELECT c.id,c.name,c.phone
+    FROM customer_lookup l JOIN customers c ON c.id=l.customer_id
+    WHERE l.name_normalized=? AND l.phone_normalized=? LIMIT 2`)
+    .bind(nameNormalized, phoneNormalized).all();
+  if (
+    cached.results.length === 1 &&
+    normalizeName(cached.results[0].name) === nameNormalized &&
+    normalizePhone(cached.results[0].phone) === phoneNormalized
+  ) return cached.results[0];
+  if (cached.results.length > 1) return null;
 
-async function dashboard(db) {
-  await initializeDatabase(db);
-  const [
-    customerCount,
-    billCount,
-    matchedCount,
-    paidCount,
-    unpaidCount,
-    exceptionCount,
-    customers,
-    bills,
-    imports
-  ] = await Promise.all([
-    db.prepare("SELECT COUNT(*) count FROM customers").first(),
-    db.prepare("SELECT COUNT(*) count FROM billing_records").first(),
-    db.prepare("SELECT COUNT(*) count FROM billing_records WHERE customer_id IS NOT NULL").first(),
-    db.prepare("SELECT COUNT(*) count FROM billing_records WHERE status='paid'").first(),
-    db.prepare("SELECT COUNT(*) count FROM billing_records WHERE status='unpaid'").first(),
-    db.prepare("SELECT COUNT(*) count FROM billing_records WHERE status IN ('pending_credit','partial','overpaid','unmatched')").first(),
-    db.prepare(`SELECT id, customer_code customerCode, payer_code payerCode,
-      name, phone, line_uid lineUid, virtual_account virtualAccount,
-      group_name groupName, updated_at updatedAt
-      FROM customers ORDER BY updated_at DESC LIMIT 3000`).all(),
-    db.prepare(`SELECT b.id, b.customer_id customerId, b.payer_code payerCode,
-      COALESCE(c.name,b.payer_name,'未識別客戶') customerName,
-      COALESCE(c.phone,'') phone, b.billing_period billingPeriod,
-      b.due_date dueDate, b.channel, b.amount_due amountDue,
-      b.amount_paid amountPaid, b.amount_outstanding amountOutstanding,
-      b.credited_amount creditedAmount, b.payment_date paymentDate,
-      b.credited_date creditedDate, b.virtual_account virtualAccount,
-      b.note, b.status, b.updated_at updatedAt
-      FROM billing_records b LEFT JOIN customers c ON c.id=b.customer_id
-      ORDER BY b.billing_period DESC,b.updated_at DESC LIMIT 5000`).all(),
-    db.prepare(`SELECT id,type,filename,row_count rowCount,
-      matched_count matchedCount,unmatched_count unmatchedCount,
-      error_count errorCount,created_at createdAt
-      FROM import_batches ORDER BY created_at DESC LIMIT 30`).all()
-  ]);
-  return json({
-    summary: {
-      customers: customerCount?.count || 0,
-      bills: billCount?.count || 0,
-      matched: matchedCount?.count || 0,
-      paid: paidCount?.count || 0,
-      unpaid: unpaidCount?.count || 0,
-      exceptions: exceptionCount?.count || 0
-    },
-    customers: customers.results,
-    bills: bills.results,
-    imports: imports.results
-  });
-}
-
-async function importCustomers(request, db) {
-  const payload = await request.json();
-  const rows = Array.isArray(payload.rows) ? payload.rows.slice(0, 10000) : [];
-  const valid = rows.filter((row) => clean(row.payerCode) && clean(row.name));
-  if (!valid.length) return json({ error: "找不到有效的繳款人代號與姓名" }, 400);
-
-  await initializeDatabase(db);
-  const now = Date.now();
-  const importId = crypto.randomUUID();
-  const statements = valid.map((row) => {
-    const payerCode = clean(row.payerCode);
-    const id = `customer_${payerCode}`.replace(/[^a-zA-Z0-9_-]/g, "_");
-    return db.prepare(`INSERT INTO customers
-      (id,customer_code,payer_code,name,phone,line_uid,virtual_account,group_name,created_at,updated_at)
-      VALUES(?,?,?,?,?,?,?,?,?,?)
-      ON CONFLICT(payer_code) DO UPDATE SET
-      customer_code=excluded.customer_code,name=excluded.name,phone=excluded.phone,
-      line_uid=CASE WHEN excluded.line_uid<>'' THEN excluded.line_uid ELSE customers.line_uid END,
-      virtual_account=CASE WHEN excluded.virtual_account<>'' THEN excluded.virtual_account ELSE customers.virtual_account END,
-      group_name=excluded.group_name,updated_at=excluded.updated_at`)
-      .bind(id, clean(row.customerCode), payerCode, clean(row.name),
-        clean(row.phone), clean(row.lineUid) || null, clean(row.virtualAccount),
-        clean(row.groupName), now, now);
-  });
-  for (let index = 0; index < statements.length; index += 80) {
-    await db.batch(statements.slice(index, index + 80));
-  }
-  await db.prepare(`INSERT INTO import_batches
-    (id,type,filename,row_count,matched_count,unmatched_count,error_count,created_at)
-    VALUES(?,'customers',?,?,?,?,?,?)`)
-    .bind(importId, clean(payload.filename) || "客戶表", rows.length,
-      valid.length, 0, rows.length - valid.length, now).run();
-  return json({ imported: valid.length, skipped: rows.length - valid.length });
-}
-
-async function importBank(request, db) {
-  const payload = await request.json();
-  const rows = Array.isArray(payload.rows) ? payload.rows.slice(0, 10000) : [];
-  const valid = rows.filter((row) =>
-    (clean(row.payerCode) || clean(row.virtualAccount)) && clean(row.billingPeriod)
+  const candidates = await db.prepare(`SELECT id,name,phone FROM customers
+    WHERE phone IS NOT NULL AND phone<>'' LIMIT 5000`).all();
+  const matches = candidates.results.filter((customer) =>
+    normalizeName(customer.name) === nameNormalized &&
+    normalizePhone(customer.phone) === phoneNormalized
   );
-  if (!valid.length) return json({ error: "找不到有效的CSR530資料" }, 400);
+  if (matches.length !== 1) return null;
+  const customer = matches[0];
+  await db.prepare(`INSERT INTO customer_lookup
+    (customer_id,name_normalized,phone_normalized,updated_at)
+    VALUES(?,?,?,?)
+    ON CONFLICT(customer_id) DO UPDATE SET
+      name_normalized=excluded.name_normalized,
+      phone_normalized=excluded.phone_normalized,
+      updated_at=excluded.updated_at`)
+    .bind(customer.id, nameNormalized, phoneNormalized, Date.now()).run();
+  return customer;
+}
 
-  await initializeDatabase(db);
-  const customerRows = await db.prepare(
-    "SELECT id,payer_code payerCode,virtual_account virtualAccount FROM customers"
-  ).all();
-  const byPayer = new Map(customerRows.results.map((row) => [clean(row.payerCode), row.id]));
-  const byVirtual = new Map(customerRows.results
-    .filter((row) => clean(row.virtualAccount))
-    .map((row) => [clean(row.virtualAccount), row.id]));
+async function bindCustomer(request, env) {
+  const payload = await request.json().catch(() => ({}));
+  const nameNormalized = normalizeName(payload.name);
+  const phoneNormalized = normalizePhone(payload.phone);
+  if (!nameNormalized || nameNormalized.length > 80 || !validPhone(phoneNormalized)) {
+    return json({ error: "請輸入正確的姓名與台灣手機號碼。" }, 400);
+  }
+
+  const customer = await matchingCustomer(env.DB, nameNormalized, phoneNormalized);
+  if (!customer) {
+    return json({ error: "資料無法核對，請確認姓名與電話，或聯繫管理單位。" }, 401);
+  }
+
+  const occupied = await env.DB.prepare(`SELECT customer_id customerId
+    FROM customer_portal_bindings WHERE phone_normalized=? LIMIT 1`)
+    .bind(phoneNormalized).first();
+  if (occupied && occupied.customerId !== customer.id) {
+    return json({ error: "資料無法核對，請聯繫管理單位。" }, 409);
+  }
+
   const now = Date.now();
-  const importId = crypto.randomUUID();
-  let matched = 0;
-  let unmatched = 0;
-  const statements = valid.map((row) => {
-    const payerCode = clean(row.payerCode) || clean(row.virtualAccount);
-    const period = clean(row.billingPeriod);
-    const virtualAccount = clean(row.virtualAccount);
-    const customerId = byPayer.get(payerCode) || byVirtual.get(virtualAccount) || null;
-    if (customerId) matched += 1;
-    else unmatched += 1;
-    const status = statusOf(row, Boolean(customerId));
-    const id = `bill_${payerCode}_${period}`.replace(/[^a-zA-Z0-9_-]/g, "_");
-    return db.prepare(`INSERT INTO billing_records
-      (id,customer_id,payer_code,payer_name,group_name,billing_period,due_date,
-      channel,amount_due,amount_paid,amount_outstanding,fee,credited_amount,
-      payment_date,credited_date,virtual_account,note,status,source_import_id,imported_at,updated_at)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-      ON CONFLICT(payer_code,billing_period) DO UPDATE SET
-      customer_id=COALESCE(excluded.customer_id,billing_records.customer_id),
-      payer_name=excluded.payer_name,group_name=excluded.group_name,
-      due_date=excluded.due_date,channel=excluded.channel,
-      amount_due=excluded.amount_due,amount_paid=excluded.amount_paid,
-      amount_outstanding=excluded.amount_outstanding,fee=excluded.fee,
-      credited_amount=excluded.credited_amount,payment_date=excluded.payment_date,
-      credited_date=excluded.credited_date,virtual_account=excluded.virtual_account,
-      note=excluded.note,status=excluded.status,source_import_id=excluded.source_import_id,
-      imported_at=excluded.imported_at,updated_at=excluded.updated_at`)
-      .bind(id, customerId, payerCode, clean(row.payerName), clean(row.groupName),
-        period, clean(row.dueDate), clean(row.channel), numeric(row.amountDue),
-        numeric(row.amountPaid), numeric(row.amountOutstanding), numeric(row.fee),
-        numeric(row.creditedAmount), clean(row.paymentDate), clean(row.creditedDate),
-        virtualAccount, clean(row.note), status, importId, now, now);
+  await env.DB.prepare(`INSERT INTO customer_portal_bindings
+    (customer_id,phone_normalized,bound_at,last_login_at)
+    VALUES(?,?,?,?)
+    ON CONFLICT(customer_id) DO UPDATE SET
+      phone_normalized=excluded.phone_normalized,
+      last_login_at=excluded.last_login_at`)
+    .bind(customer.id, phoneNormalized, now, now).run();
+  const token = await createSession(env, customer.id);
+  return json({ ok: true }, 200, { "set-cookie": cookie(token) });
+}
+
+async function loginCustomer(request, env) {
+  const payload = await request.json().catch(() => ({}));
+  const phoneNormalized = normalizePhone(payload.phone);
+  if (!validPhone(phoneNormalized)) {
+    return json({ error: "電話或綁定狀態無法核對。" }, 401);
+  }
+  const binding = await env.DB.prepare(`SELECT customer_id customerId
+    FROM customer_portal_bindings WHERE phone_normalized=? LIMIT 1`)
+    .bind(phoneNormalized).first();
+  if (!binding) return json({ error: "電話或綁定狀態無法核對。" }, 401);
+
+  await env.DB.prepare(`UPDATE customer_portal_bindings
+    SET last_login_at=? WHERE customer_id=?`)
+    .bind(Date.now(), binding.customerId).run();
+  const token = await createSession(env, binding.customerId);
+  return json({ ok: true }, 200, { "set-cookie": cookie(token) });
+}
+
+async function customerAccount(request, env) {
+  const customerId = await sessionCustomerId(request, env);
+  if (!customerId) return json({ error: "登入已失效，請重新登入。" }, 401);
+
+  const [customer, bills, reports] = await Promise.all([
+    env.DB.prepare(`SELECT c.id,c.name,b.phone_normalized phone
+      FROM customers c JOIN customer_portal_bindings b ON b.customer_id=c.id
+      WHERE c.id=? LIMIT 1`).bind(customerId).first(),
+    env.DB.prepare(`SELECT id,billing_period billingPeriod,due_date dueDate,
+      amount_due amountDue,amount_paid amountPaid,amount_outstanding amountOutstanding,
+      payment_date paymentDate,credited_date creditedDate,status,updated_at updatedAt
+      FROM billing_records WHERE customer_id=?
+      ORDER BY billing_period DESC,updated_at DESC LIMIT 36`).bind(customerId).all(),
+    env.DB.prepare(`SELECT id,billing_record_id billingRecordId,status,created_at createdAt
+      FROM payment_reports WHERE customer_id=?
+      ORDER BY created_at DESC LIMIT 50`).bind(customerId).all()
+  ]);
+  if (!customer) return json({ error: "找不到客戶帳戶，請重新綁定。" }, 404);
+  const rows = bills.results;
+  return json({
+    customer: {
+      name: customer.name,
+      phoneMasked: maskPhone(customer.phone)
+    },
+    summary: {
+      total: rows.length,
+      open: rows.filter((bill) => bill.status !== "paid").length
+    },
+    bills: rows,
+    paymentReports: reports.results
   });
-  for (let index = 0; index < statements.length; index += 80) {
-    await db.batch(statements.slice(index, index + 80));
-  }
-  await db.prepare(`INSERT INTO import_batches
-    (id,type,filename,row_count,matched_count,unmatched_count,error_count,created_at)
-    VALUES(?,'bank',?,?,?,?,?,?)`)
-    .bind(importId, clean(payload.filename) || "CSR530", rows.length,
-      matched, unmatched, rows.length - valid.length, now).run();
-  return json({ imported: valid.length, matched, unmatched, skipped: rows.length - valid.length });
 }
 
-async function api(request, env) {
+async function reportPayment(request, env) {
+  const customerId = await sessionCustomerId(request, env);
+  if (!customerId) return json({ error: "登入已失效，請重新登入。" }, 401);
+  const payload = await request.json().catch(() => ({}));
+  const billingRecordId = clean(payload.billingRecordId);
+  if (!billingRecordId || billingRecordId.length > 160) {
+    return json({ error: "請選擇要回報的帳單。" }, 400);
+  }
+  const [bill, binding] = await Promise.all([
+    env.DB.prepare(`SELECT id,status FROM billing_records
+      WHERE id=? AND customer_id=? LIMIT 1`).bind(billingRecordId, customerId).first(),
+    env.DB.prepare(`SELECT phone_normalized phone FROM customer_portal_bindings
+      WHERE customer_id=? LIMIT 1`).bind(customerId).first()
+  ]);
+  if (!bill || !binding) return json({ error: "找不到可回報的帳單。" }, 404);
+  if (bill.status === "paid") return json({ error: "此帳單已確認入帳。" }, 409);
+
+  const existing = await env.DB.prepare(`SELECT id FROM payment_reports
+    WHERE customer_id=? AND billing_record_id=? AND status='pending' LIMIT 1`)
+    .bind(customerId, billingRecordId).first();
+  if (existing) return json({ ok: true, alreadyReported: true });
+
+  await env.DB.prepare(`INSERT INTO payment_reports
+    (id,customer_id,billing_record_id,phone_normalized,status,note,created_at,resolved_at)
+    VALUES(?,?,?,?, 'pending',NULL,?,NULL)`)
+    .bind(crypto.randomUUID(), customerId, billingRecordId, binding.phone, Date.now()).run();
+  return json({ ok: true, status: "pending" }, 201);
+}
+
+async function publicApi(request, env) {
   const url = new URL(request.url);
-  if (url.pathname === "/api/auth/status") {
-    return json({
-      authenticated: await authenticated(request, env),
-      protected: true
-    });
+  if (url.pathname === "/api/public/status" && request.method === "GET") {
+    return json({ authenticated: Boolean(await sessionCustomerId(request, env)), protected: true });
   }
-  if (url.pathname === "/api/auth/login" && request.method === "POST") {
-    return login(request, env);
+  if (!env.ADMIN_PASSWORD) return json({ error: "客戶入口尚未完成安全設定。" }, 503);
+  if (!env.DB) return json({ error: "客戶入口尚未連接資料庫。" }, 503);
+  await initializePortal(env.DB);
+  if (request.method === "POST" && !sameOrigin(request)) {
+    return json({ error: "不允許跨站操作。" }, 403);
   }
-  if (url.pathname === "/api/auth/logout" && request.method === "POST") {
-    return json({ ok: true }, 200, {
-      "set-cookie": `${SESSION_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0`
-    });
+  if (url.pathname === "/api/public/bind" && request.method === "POST") {
+    return bindCustomer(request, env);
   }
-  if (!(await authenticated(request, env))) return json({ error: "尚未登入" }, 401);
-  if (!env.DB) return json({ error: "尚未設定D1資料庫binding：DB" }, 503);
-  if (url.pathname === "/api/dashboard" && request.method === "GET") {
-    return dashboard(env.DB);
+  if (url.pathname === "/api/public/login" && request.method === "POST") {
+    return loginCustomer(request, env);
   }
-  if (url.pathname === "/api/import/customers" && request.method === "POST") {
-    return importCustomers(request, env.DB);
+  if (url.pathname === "/api/public/account" && request.method === "GET") {
+    return customerAccount(request, env);
   }
-  if (url.pathname === "/api/import/bank" && request.method === "POST") {
-    return importBank(request, env.DB);
+  if (url.pathname === "/api/public/payment-report" && request.method === "POST") {
+    return reportPayment(request, env);
   }
-  return json({ error: "找不到API" }, 404);
+  if (url.pathname === "/api/public/logout" && request.method === "POST") {
+    return json({ ok: true }, 200, { "set-cookie": cookie("", 0) });
+  }
+  return json({ error: "找不到此客戶服務。" }, 404);
 }
 
+async function enrichedAdminDashboard(request, env, context) {
+  const response = await adminWorker.fetch(request, env, context);
+  if (!response.ok || !env.DB) return response;
+  await initializePortal(env.DB);
+  const [bindings, reports] = await Promise.all([
+    env.DB.prepare("SELECT customer_id customerId FROM customer_portal_bindings").all(),
+    env.DB.prepare(`SELECT billing_record_id billingRecordId,COUNT(*) count
+      FROM payment_reports WHERE status='pending' AND billing_record_id IS NOT NULL
+      GROUP BY billing_record_id`).all()
+  ]);
+  const boundCustomers = new Set(bindings.results.map((row) => row.customerId));
+  const pendingReports = new Map(
+    reports.results.map((row) => [row.billingRecordId, Number(row.count) || 0])
+  );
+  const data = await response.json();
+  data.customers = (data.customers || []).map((customer) => ({
+    ...customer,
+    portalBound: boundCustomers.has(customer.id)
+  }));
+  data.bills = (data.bills || []).map((bill) => ({
+    ...bill,
+    paymentReportPending: pendingReports.get(bill.id) || 0
+  }));
+  return json(data);
+}
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, context) {
     try {
       const url = new URL(request.url);
-      if (url.pathname.startsWith("/api/")) return await api(request, env);
-      return env.ASSETS.fetch(request);
-    } catch (error) {
-      return json({ error: "系統暫時無法處理請求" }, 500);
+      if (url.pathname.startsWith("/api/public/")) {
+        return await publicApi(request, env);
+      }
+      if (url.pathname === "/api/dashboard" && request.method === "GET") {
+        return await enrichedAdminDashboard(request, env, context);
+      }
+      return await adminWorker.fetch(request, env, context);
+    } catch {
+      return json({ error: "系統暫時無法處理，請稍後再試。" }, 500);
     }
   }
 };

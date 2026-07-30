@@ -316,7 +316,7 @@ function reconciliation() {
       bills.map((bill) => `<tr><td><b>${esc(bill.customerName)}</b><small>${esc(bill.payerCode)}</small></td>
       <td>${esc(period(bill.billingPeriod))}</td><td><strong>${money(bill.amountDue)}</strong></td>
       <td>${money(bill.amountPaid)}</td><td>${esc(bill.creditedDate || bill.paymentDate || "—")}</td>
-      <td>${statusBadge(bill.status)}</td><td>${esc(bill.note || "—")}</td></tr>`)
+      <td>${statusBadge(bill.status)}${bill.paymentReportPending ? `<small class="portal-report">客戶已回報</small>` : ""}</td><td>${esc(bill.note || "—")}</td></tr>`)
     ) : empty("找不到資料", "請調整搜尋條件或上傳CSR530。")}</section>`;
 }
 
@@ -326,14 +326,15 @@ function crm() {
     !keyword || [customer.name, customer.phone, customer.payerCode, customer.customerCode]
       .join(" ").toLowerCase().includes(keyword)
   );
-  return `<section class="intro"><span>客戶CRM</span><h2>客戶帳戶與LINE綁定準備</h2>
-    <p>UID欄位已預留；未來可綁定LINE身分並推播帳單。</p></section>
+  return `<section class="intro"><span>客戶CRM</span><h2>客戶帳戶、電話綁定與LINE UID</h2>
+    <p>主要以姓名與電話核對，LINE UID欄位持續保留。</p></section>
     ${filter("搜尋姓名、電話、客戶編號或代號", false)}
     <section class="panel table-wrap">${customers.length ? table(
-      ["客戶", "電話", "客戶編號", "繳款人代號", "虛擬帳號", "LINE UID"],
+      ["客戶", "電話", "客戶編號", "繳款人代號", "虛擬帳號", "客戶入口", "LINE UID"],
       customers.map((customer) => `<tr><td><b>${esc(customer.name)}</b><small>${esc(customer.groupName || "未分組")}</small></td>
       <td>${esc(customer.phone || "—")}</td><td>${esc(customer.customerCode || "—")}</td>
       <td><code>${esc(customer.payerCode)}</code></td><td><code>${esc(customer.virtualAccount || "—")}</code></td>
+      <td>${customer.portalBound ? '<span class="uid">已綁定</span>' : "未綁定"}</td>
       <td>${customer.lineUid ? '<span class="uid">已綁定</span>' : "未綁定"}</td></tr>`)
     ) : empty("尚無客戶資料", "請先上傳客戶表。")}</section>`;
 }
